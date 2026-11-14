@@ -6,86 +6,56 @@
 
 1. 用自己的飞书自建应用（App ID / App Secret）调用飞书开放平台接口，
    遍历企业全部部门并拉取人员信息，保存到数据库；
-2. **通道一**：接收发给机器人的消息事件（`im.message.receive_v1`），实时持久化；
-3. **通道二**：用本人账号授权，每 5 秒轮询「私聊给我本人」的新消息，补齐飞书不开放的事件盲区；
-4. 两类消息统一在前端界面展示、按来源筛选，全部操作通过浏览器完成。
+2. 接收飞书消息事件（`im.message.receive_v1` 等），把消息事件持久化并在前端实时查看；
+3. 全部操作通过浏览器界面完成，无需命令行。
 
 ## Product shape
 
 - 类别：QW Pages 动态页（Node.js 22 单入口 `server.mjs` + Vite/React/TS 客户端）。
-- 飞书对接分两套身份，互不混淆：
-  - **tenant 侧（SDK `@larksuiteoapi/node-sdk`）**：`lark.Client` 处理 tenant_access_token
-    的获取/缓存/续期，通讯录同步走 `contact.v3.department.children` 与
-    `contact.v3.user.findByDepartment`；`lark.WSClient` 长连接 +
-    `lark.EventDispatcher`/`lark.adaptDefault('/webhook/feishu')` 收实时事件。
-  - **user 侧（原生 `fetch` 直连 OpenAPI）**：设备流拿到 `user_access_token`，
-    调 `GET /im/v1/chats?types=p2p` 枚举本人全部单聊、
-    `GET /im/v1/messages` 按时间窗增量拉取。tenant token 无法读取用户私聊，必须单独授权。
-- 消息采集双通道，共用同一张 `feishu_events` 表：
-  | 通道 | 触发方式 | 来源标识 |
-  |---|---|---|
-  | 机器人实时 | WebSocket 长连接 / Webhook，秒级 | `bot_realtime` |
-  | 我的私聊 | `setInterval` 每 5 秒，user 身份增量轮询 | `user_poll` |
-  | 历史补拉（旧版兜底） | tenant 身份补拉已知会话 | `history_poll` |
-  - **来源不新增列**：由 `event_id` 前缀推导（飞书原生 event_id / `user_poll:<message_id>` /
-    `poll:<message_id>`），避免改动平台固定表结构。
-  - 去重按 `message_id`：轮询事件与实时事件共用 `knownMessageIds()`，
-    从 `event_id` 与 `raw.message.message_id` 双向比对。
-  - 轮询位点（epoch 秒）与 OAuth token 存 `app_config` 表，90 秒重叠窗口防边界丢消息；
-    只保留别人发来的消息（排除自己的 open_id、已删除消息）。
-- OAuth 设备流：`POST accounts.feishu.cn/oauth/v1/device_authorization`（Basic Auth，
-  scope `im:chat:read im:message.p2p_msg:get_as_user offline_access`）→ 用户扫码 →
-  后端轮询 `POST accounts.feishu.cn/oauth/v3/token`（device_code grant）；
-  刷新走同端点 `refresh_token` grant（JSON body），提前 5 分钟刷新、滚动续期。
-  refresh_token 剩余寿命 < 72h 时通过 `ALERT_WEBHOOK`（可选）与前端醒目告警提醒重新扫码。
-- 视觉：深空墨蓝控制台风格（深色底 + 网格纹理、电光蓝/青色点缀、玻璃质感卡片）。
+- 飞书对接全部基于官方 SDK `@larksuiteoapi/node-sdk`：
+  - **API 调用**：`lark.Client`（tenant_access_token 获取/缓存/续期由 SDK 自动处理），
+    通讯录同步走 `contact.v3.department.children`（fetch_child 分页）与
+    `contact.v3.user.findByDepartment`（分页）。
+  - **消息订阅（默认）**：`lark.WSClient` WebSocket 长连接，配置凭证后自动建立，
+    无需公网回调地址；凭证变更或保存配置时自动重建连接，断线自动重连。
+  - **消息订阅（备选）**：`lark.EventDispatcher` + `lark.adaptDefault('/webhook/feishu')`
+    Webhook 回调，URL 验证 challenge、Encrypt Key AES 解密、Verification Token
+    验签全部由 SDK 处理；凭证通过 `webhookCredentialsProvider` 每次请求从数据库
+    动态读取。两种模式可同时开启，事件按 event_id 去重。
+  - 连通性测试仍直调 `tenant_access_token` 接口（不依赖通讯录权限即可验证凭证）。
+- 视觉：深空墨蓝控制台风格（深色底 + 网格纹理背景、电光蓝/青色点缀、玻璃质感
+  卡片、渐变标题、入场 fadeUp 动画，`prefers-reduced-motion` 下禁用动画）。
 - 三个功能页签：
-  - **通讯录**：一键同步、统计卡片、搜索与部门筛选、人员表格。
-  - **消息订阅**：四张状态卡（采集通道 / 机器人长连接 / 我的私聊轮询 / 授权寿命）、
-    user 授权引导（链接 + 授权码，后端自动等待扫码）、长连接与 Webhook 配置指引、
-    来源筛选（全部 / 机器人实时 / 我的私聊 / 历史补拉）、统一消息时间线（来源徽标）、
-    每 5 秒自动刷新。
-  - **设置**：录入 App ID / App Secret / Encrypt Key / Verification Token（脱敏回传）、连通性测试。
-- 服务端全部在 `server.mjs`：
-  - `GET /healthz`（含 database 诊断）、`GET /api/health`（仅 `{status:"ok"}`）；
-  - `GET/POST /api/config`、`POST /api/config/test`、`POST /api/sync`；
-  - `GET /api/subscription`（长连接状态 + `poll` 轮询状态 + `userAuth` 授权状态）；
-  - `GET /api/user-auth`、`POST /api/user-auth/start`（设备流授权）；
-  - `POST /api/poll`（手动触发一次 5 秒轮询）；
-  - `GET /api/events?limit=&source=&event_type=`、`GET /api/stats`、
-    `GET /api/departments`、`GET /api/users`；
-  - `POST /webhook/feishu`（SDK 适配器处理 challenge / 解密 / 验签）。
-- 数据库：平台 Supabase 兼容库（仅服务端访问），表：`app_config`、
-  `feishu_departments`、`feishu_users`、`feishu_events`。DDL 由平台 migrate 执行，
-  应用不自建表、不加列。
-
-## watcher-go/（可选：独立部署的生产级采集器）
-
-同一套「本人私聊 5 秒轮询」能力的 Go 静态二进制实现，零第三方依赖：
-
-- `cmd/watcher`：三种模式 `auth`（设备流授权）/ 默认 serve / `status`（查 token 寿命）；
-- `internal/lark`：OAuth 设备流 + 滚动刷新 + chats/messages API；
-- `internal/poller`：固定节奏 Ticker、有界并发、崩溃安全（先落 seen 再推游标）；
-- `internal/sdnotify`：自实现 systemd notify 协议（`READY=1` + `WATCHDOG=1`）；
-- `internal/notify`：token 寿命告警；`internal/store`：原子落盘状态；
-- `Dockerfile` 多阶段构建 scratch 镜像；`deploy/` 含 systemd 单元、compose、env 模板。
-
-它与主应用是**二选一**关系，不要同时对同一账号运行（会重复拉取）。
-主应用（Node）自包含，开箱即用；`watcher-go` 适合需要 systemd watchdog、
-token 告警、纯静态二进制部署的服务器场景。
+  - **通讯录**：一键同步按钮（SDK 遍历部门 → 按部门分页拉取人员 → upsert 入库，
+    多部门用户合并 department_ids）、统计卡片（部门数/人员数/最近同步时间）、
+    关键字搜索与部门筛选、人员表格。
+  - **消息订阅**：长连接状态卡片（连接状态/最近连接时间/错误信息，随事件列表
+    每 5 秒轮询 `/api/subscription`）、长连接模式配置指引、Webhook 备选指引
+    （回调 URL + SDK 自动解密/验签说明）、实时轮询消息事件列表。
+  - **设置**：录入/更新飞书 App ID、App Secret、Encrypt Key、Verification Token
+    （存于 `app_config` 表，接口只回传脱敏值），并可测试连通性。
+- 服务端（全部在 `server.mjs`）：
+  - `GET /healthz`、`GET /api/health`：无依赖健康检查；
+  - `GET/POST /api/config`：配置读取（脱敏）/写入（写入后自动重建长连接）；
+  - `GET /api/subscription`：长连接订阅状态（state/appId 脱敏/最近连接/错误）；
+  - `POST /api/config/test`：连通性测试；
+  - `POST /api/sync`：执行通讯录同步；
+  - `GET /api/departments`、`GET /api/users`、`GET /api/events`、`GET /api/stats`；
+  - `POST /webhook/feishu`：飞书事件回调（SDK 适配器处理 challenge/解密/验签，
+    事件入库、快速 200）。
+- 数据库：平台 Supabase 兼容库（仅服务端访问，浏览器不持有任何密钥），
+  表：`app_config`、`feishu_departments`、`feishu_users`、`feishu_events`。
+  DDL 由平台 migrate 接口执行，应用不自建表。
 
 ## Constraints
 
-- 服务端逻辑必须全部在 `server.mjs`（发布目录顶层只允许 `dist/`、`package.json`、
-  `package-lock.json`、`server.mjs` 四项，runtime 测试会严格断言）；
-  **不要新建 `server/` 目录**，`prepare-publish.mjs` 会把它拷进发布目录导致断言失败。
-- Supabase 客户端按 qw-pages-supabase 双模式懒加载，并带本地文件存储兜底；
-  缺少数据库变量时服务必须可启动、`/api/health` 必须只返回 `{status:"ok"}`；
-  长连接订阅在数据库不可用时保持 disabled，不阻塞服务。
-- 飞书凭证只存 `app_config` 表，任何接口不得回传明文 Secret 或 token；
-  `/api/user-auth*` 只回授权状态与验证链接，不回 `device_code` / `access_token`。
-- 长连接事件、Webhook 事件与轮询消息共用同一入库函数并按 `event_id`/`message_id` 去重
-  （飞书对未确认事件会重试；双通道并行时也会重复投递）。
-- 5 秒轮询必须轻量：无消息时不写库、单会话失败不中断整轮、
-  并发上限 6，避免撞 IM 接口 QPS。
+- 服务端逻辑必须全部在 `server.mjs`（发布目录顶层只允许 dist/package.json/
+  package-lock.json/server.mjs，runtime 测试会校验）。
+- Supabase 客户端按 qw-pages-supabase 双模式懒加载（Broker v2 / legacy env），
+  缺少数据库变量时服务必须可启动、`/healthz` 必须健康；长连接订阅在数据库
+  不可用时保持 disabled，不阻塞服务。
+- 飞书凭证只存 `app_config` 表，任何接口不得回传明文 Secret（订阅状态里的
+  App ID 也只回传脱敏值）。
+- 长连接事件与 Webhook 事件共用同一入库函数，按 event_id 去重（飞书对未确认
+  事件会重试；双模式并行时也会重复投递）。
 - 无应用内账号体系（内部工具）；如需限制访问，可用平台 SSO 发布选项。
