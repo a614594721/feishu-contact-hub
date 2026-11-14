@@ -1199,12 +1199,17 @@ const server = createServer(async (request, response) => {
     }
 
     const body = request.method === "HEAD" ? undefined : await readFile(file);
-    send(
-      response,
-      200,
-      body,
-      contentTypes.get(extname(file).toLowerCase()) ?? "application/octet-stream",
-    );
+    // 缓存策略：带内容哈希的 /assets/* 可以长期缓存；入口 HTML 必须每次回源校验，
+    // 否则重新发布会换掉 JS 的文件名，旧 HTML 会去请求已不存在的资源而白屏
+    const hashedAsset = url.pathname.startsWith("/assets/");
+    response.writeHead(200, {
+      "content-type": contentTypes.get(extname(file).toLowerCase()) ?? "application/octet-stream",
+      "x-content-type-options": "nosniff",
+      "cache-control": hashedAsset
+        ? "public, max-age=31536000, immutable"
+        : "no-cache, must-revalidate",
+    });
+    response.end(body);
   } catch (error) {
     console.error("Request failed");
     send(response, 500, "Internal Server Error", "text/plain; charset=utf-8");
