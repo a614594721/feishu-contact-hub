@@ -1,0 +1,52 @@
+# 生产部署文件：systemd 直管 docker 容器（推荐，含 watchdog）
+# 安装：
+#   1) docker build -t lark-watcher:latest /path/to/this-repo
+#   2) mkdir -p /opt/lark-watch/data
+#   3) cp deploy/env /opt/lark-watch/env && vim /opt/lark-watch/env   # 填入 secret
+#   4) cp deploy/lark-watcher.service /etc/systemd/system/
+#   5) systemctl daemon-reload && systemctl enable --now lark-watcher
+#   6) 首次授权：docker exec -it lark-watcher /lark-watcher -mode auth
+#      （扫码完成后自动恢复监听，无需重启服务）
+
+[Unit]
+Description=Lark P2P Watcher (docker, notify+watchdog)
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=notify
+# 容器内进程通过挂载的 /run/systemd/notify socket 直接向 systemd 报告
+NotifyAccess=all
+# 30 秒不喂狗 = 卡死/挂起 → systemd 杀掉并重启容器
+WatchdogSec=30
+TimeoutStartSec=180
+
+# 清掉可能残留的旧容器（"-" 前缀忽略失败）
+# 关键：systemd 把 NOTIFY_SOCKET/WATCHDOG_USEC 给 docker CLI，但不会自动带进容器，
+#       必须用 "-e VAR"（不带值）显式从宿主继承，否则容器内 sdnotify 收不到 socket，
+#       Type=notify 会等不到 READY 而超时，WatchdogSec 也完全失效。
+ExecStartPre=-/usr/bin/docker rm -f lark-watcher
+
+ExecStart=/usr/bin/docker run \
+  --name lark-watcher \
+  --env-file /opt/lark-watch/env \
+  -e NOTIFY_SOCKET \
+  -e WATCHDOG_USEC \
+  -v /opt/lark-watch/data:/data \
+  -v /run/systemd/notify:/run/systemd/notify \
+  lark-watcher:latest
+
+# docker stop 会向容器 PID1（即 /lark-watcher，exec 形式 ENTRYPOINT）发 SIGTERM，
+# watcher 完成当前轮、落盘游标后退出
+ExecStop=/usr/bin/docker stop lark-watcher
+ExecStopPost=-/usr/bin/docker rm -f lark-watcher
+
+Restart=always
+RestartSec=5
+
+# 日志走 journald，systemd 自带轮转
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

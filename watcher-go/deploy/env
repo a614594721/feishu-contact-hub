@@ -1,0 +1,15 @@
+# 复制到 /opt/lark-watch/env 并填入真实值（该文件含密钥，chmod 600）
+LARK_APP_ID=cli_xxxxxxxxxxxxxxxx
+LARK_APP_SECRET=xxxx
+
+# 轮询参数（默认值见 Dockerfile，可覆盖）
+WATCH_INTERVAL=5s
+WATCH_OVERLAP=90s
+WATCH_CONCURRENCY=6
+OUTPUT_FILE=/data/msgs.jsonl
+
+# token 寿命告警（剩余不足 72h 时推提醒；每 12h 最多提醒一次）
+ALERT_WEBHOOK=
+ALERT_WEBHOOK_TYPE=wecom
+TOKEN_ALERT_BEFORE=72h
+TOKEN_ALERT_EVERY=12h

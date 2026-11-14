@@ -40,6 +40,9 @@ interface User {
   synced_at: string;
 }
 
+/** 消息来源：机器人实时事件 / 我本人私聊轮询 / 旧版历史补拉 */
+type MessageSource = "bot_realtime" | "user_poll" | "history_poll";
+
 interface FeishuEvent {
   id: number;
   event_id: string;
@@ -52,6 +55,7 @@ interface FeishuEvent {
   content_text: string;
   event_time: string | null;
   received_at: string;
+  source: MessageSource;
 }
 
 interface Stats {
@@ -63,11 +67,31 @@ interface Stats {
 interface PollStatus {
   enabled: boolean;
   intervalMs: number;
+  mode: string;
   lastRunAt: string | null;
   chats: number;
   scanned: number;
   inserted: number;
   error: string;
+  userAuthorized: boolean;
+  userName: string;
+  refreshHoursLeft: number;
+  tokenAlert: string;
+}
+
+interface UserAuth {
+  status: "idle" | "pending" | "authorized" | "error" | "expired";
+  error: string;
+  verificationUri: string;
+  userCode: string;
+  expiresAt: string | null;
+  authorized: boolean;
+  openId: string;
+  userName: string;
+  accessExpiresAt: string | null;
+  refreshExpiresAt: string | null;
+  refreshHoursLeft: number;
+  needAlert: boolean;
 }
 
 interface Subscription {
@@ -78,6 +102,7 @@ interface Subscription {
   error: string;
   webhookPath: string;
   poll?: PollStatus;
+  userAuth?: UserAuth;
 }
 
 type TabKey = "contacts" | "events" | "settings";
@@ -430,25 +455,36 @@ function ContactsTab({
 
 /* SECTION: events tab */
 
+const SOURCE_META: Record<MessageSource, { label: string; hint: string }> = {
+  bot_realtime: { label: "机器人实时", hint: "长连接 / Webhook 事件推送" },
+  user_poll: { label: "我的私聊", hint: "5 秒轮询 · user 身份" },
+  history_poll: { label: "历史补拉", hint: "旧版兜底补拉" },
+};
+
 function EventsTab() {
   const [events, setEvents] = useState<FeishuEvent[]>([]);
   const [subscription, setSubscription] = useState<Subscription | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [sourceFilter, setSourceFilter] = useState<"all" | MessageSource>("all");
   const [copied, setCopied] = useState(false);
   const [polling, setPolling] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const webhookUrl = `${window.location.origin}/webhook/feishu`;
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadEvents = useCallback(async () => {
     try {
-      const data = await apiGet<{ events: FeishuEvent[] }>("/api/events?limit=100");
+      const params = new URLSearchParams({ limit: "100" });
+      if (sourceFilter !== "all") params.set("source", sourceFilter);
+      const data = await apiGet<{ events: FeishuEvent[] }>(`/api/events?${params.toString()}`);
       setEvents(data.events);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
     }
-  }, []);
+  }, [sourceFilter]);
 
   const loadSubscription = useCallback(async () => {
     try {
@@ -490,17 +526,31 @@ function EventsTab() {
     }
   }
 
-  /** 手动触发一次私聊历史消息补拉，用于排查或即时回填 */
-  async function runHistoryPoll() {
+  /** 手动触发一次 5 秒轮询，便于排查或即时回填 */
+  async function runPollOnce() {
     setPolling(true);
     try {
       await apiPost("/api/poll");
       await Promise.all([loadEvents(), loadSubscription()]);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "补拉失败");
+      setError(err instanceof Error ? err.message : "轮询失败");
     } finally {
       setPolling(false);
+    }
+  }
+
+  /** 发起 user 身份设备流授权；后端会自动等扫码完成并开始 5 秒轮询 */
+  async function startAuth() {
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      await apiPost("/api/user-auth/start");
+      await loadSubscription();
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "发起授权失败");
+    } finally {
+      setAuthBusy(false);
     }
   }
 
@@ -513,44 +563,124 @@ function EventsTab() {
   };
   const state = subscription?.state ?? "disabled";
   const meta = stateMeta[state];
+  const poll = subscription?.poll;
+  const auth = subscription?.userAuth;
 
   return (
     <section aria-label="消息订阅">
       <div className="stat-row">
         <div className="stat-card">
-          <span className="stat-label">订阅方式</span>
-          <span className="stat-value small">飞书官方 SDK · WebSocket 长连接</span>
+          <span className="stat-label">采集通道</span>
+          <span className="stat-value small">机器人实时 + 我的私聊轮询</span>
+          <span className="sub">两类消息统一入同一张事件表</span>
         </div>
         <div className="stat-card">
-          <span className="stat-label">连接状态</span>
+          <span className="stat-label">通道一 · 机器人实时</span>
           <span className={`status-pill ${meta.cls}`}>
             <span className="dot" />
             {meta.label}
           </span>
+          <span className="sub">最近连接 {formatTime(subscription?.lastConnectedAt ?? null)}</span>
         </div>
         <div className="stat-card">
-          <span className="stat-label">最近连接</span>
-          <span className="stat-value small">{formatTime(subscription?.lastConnectedAt ?? null)}</span>
-        </div>
-        <div className="stat-card">
-          <span className="stat-label">私聊历史补拉（定时）</span>
+          <span className="stat-label">通道二 · 我的私聊轮询</span>
           <span className="stat-value small">
-            {subscription?.poll
-              ? `每 ${Math.round(subscription.poll.intervalMs / 1000)} 秒 · ${subscription.poll.chats} 个会话`
-              : "—"}
+            {poll?.userAuthorized
+              ? `每 ${Math.round((poll.intervalMs ?? 5000) / 1000)} 秒 · ${poll.chats} 个单聊`
+              : "未授权，尚未启动"}
           </span>
           <span className="sub">
-            {subscription?.poll?.error
-              ? `失败：${subscription.poll.error}`
-              : subscription?.poll?.lastRunAt
-                ? `最近 ${formatTime(subscription.poll.lastRunAt)} · 补入 ${subscription.poll.inserted} 条`
-                : "断线期间漏收的消息由此回填"}
+            {poll?.error
+              ? `失败：${poll.error}`
+              : poll?.userAuthorized
+                ? `最近 ${formatTime(poll.lastRunAt)} · 扫 ${poll.scanned} 条 / 新增 ${poll.inserted} 条`
+                : "完成下方扫码授权后自动开始"}
           </span>
+        </div>
+        <div className="stat-card">
+          <span className="stat-label">授权与凭证寿命</span>
+          <span className="stat-value small">
+            {auth?.authorized ? `${auth.userName || "已授权账号"}` : "待授权"}
+          </span>
+          <span className="sub">
+            {auth?.authorized
+              ? `refresh 剩余 ${auth.refreshHoursLeft} 小时 · 自动滚动续期`
+              : "user_access_token 需本人扫码一次"}
+          </span>
+          {auth?.needAlert && (
+            <span className="inline-msg error">寿命不足 72 小时，请重新授权</span>
+          )}
         </div>
       </div>
 
+      <div className="callout auth-callout">
+        <h2>通道二：私聊给我本人的消息（5 秒轮询）</h2>
+        <p>
+          飞书只对<strong>机器人</strong>推送实时事件，「别人私聊发给我本人」没有事件通道。
+          本服务用<strong>我自己的飞书账号</strong>授权（user_access_token），每 5 秒枚举全部单聊会话、
+          增量拉取新消息，只保留别人发给我的，按 message_id 去重后与机器人事件一起展示在下方。
+        </p>
+        <p>
+          需在开放平台为应用开通 <code className="inline-code">im:chat:read</code>、
+          <code className="inline-code">im:message.p2p_msg:get_as_user</code>、
+          <code className="inline-code">刷新 user_access_token</code> 并发布版本。
+        </p>
+
+        {!auth?.authorized && auth?.status !== "pending" && (
+          <div className="toolbar">
+            <button className="primary-btn" disabled={authBusy} onClick={() => void startAuth()}>
+              {authBusy ? "发起中…" : "扫码授权我的飞书账号"}
+            </button>
+            <button className="ghost-btn" disabled={authBusy} onClick={() => void startAuth()}>
+              重新发起
+            </button>
+          </div>
+        )}
+
+        {auth?.status === "pending" && (
+          <div className="auth-pending">
+            <p>
+              请在浏览器打开授权页，或用飞书 App 扫码：
+              <a className="auth-link" href={auth.verificationUri} target="_blank" rel="noreferrer">
+                {auth.verificationUri}
+              </a>
+            </p>
+            {auth.userCode && (
+              <p>
+                授权码：<code className="inline-code">{auth.userCode}</code>
+                {auth.expiresAt && ` · ${formatTime(auth.expiresAt)} 前有效`}
+              </p>
+            )}
+            <p>扫码完成后后端自动领取 token 并开始 5 秒轮询，本页会自动刷新状态，无需重启服务。</p>
+            <button className="ghost-btn" disabled={authBusy} onClick={() => void startAuth()}>
+              重新生成授权链接
+            </button>
+          </div>
+        )}
+
+        {auth?.authorized && (
+          <div className="auth-ok">
+            <p>
+              已授权：<strong>{auth.userName || "—"}</strong>
+              {auth.openId && <span className="mono sub"> {auth.openId}</span>} · refresh_token 剩余{" "}
+              <strong>{auth.refreshHoursLeft}</strong> 小时（每次轮询自动滚动续期）。
+            </p>
+            <p>
+              若长期停机超过 7 天导致 refresh_token 失效，重新扫码一次即可；游标与去重状态不会丢失。
+            </p>
+            <button className="ghost-btn" disabled={authBusy} onClick={() => void startAuth()}>
+              重新授权
+            </button>
+          </div>
+        )}
+
+        {auth?.error && <span className="inline-msg error">授权异常：{auth.error}</span>}
+        {authError && <span className="inline-msg error">{authError}</span>}
+        {poll?.tokenAlert && <span className="inline-msg error">{poll.tokenAlert}</span>}
+      </div>
+
       <div className="callout">
-        <h2>事件订阅配置（推荐：长连接模式）</h2>
+        <h2>通道一：发给机器人的消息（实时长连接）</h2>
         <p>
           在飞书开放平台的应用后台，进入「事件与回调 → 事件配置」，订阅方式选择
           <strong>「使用长连接接收事件」</strong>，然后添加事件
@@ -568,9 +698,7 @@ function EventsTab() {
 
       <div className="callout">
         <h2>备选：Webhook 回调模式</h2>
-        <p>
-          若订阅方式选择「将事件发送至开发者服务器」，请求地址填写：
-        </p>
+        <p>若订阅方式选择「将事件发送至开发者服务器」，请求地址填写：</p>
         <div className="url-row">
           <code className="mono url">{webhookUrl}</code>
           <button className="ghost-btn" onClick={() => void copyWebhook()}>
@@ -579,12 +707,25 @@ function EventsTab() {
         </div>
         <p>
           URL 验证、Encrypt Key 解密与 Verification Token 验签均由官方 SDK 自动处理：
-          若应用开启了加密或校验，请在「设置」页填入对应密钥（未开启可不填，
-          Token 配置后将进行严格校验）。两种模式可同时开启，事件按 ID 自动去重。
+          若应用开启了加密或校验，请在「设置」页填入对应密钥（未开启可不填）。
+          两种订阅模式可同时开启，事件按 ID 自动去重。
         </p>
       </div>
 
       <div className="toolbar">
+        <label className="switch-label">
+          来源
+          <select
+            className="filter-select"
+            value={sourceFilter}
+            onChange={(event) => setSourceFilter(event.target.value as "all" | MessageSource)}
+          >
+            <option value="all">全部通道</option>
+            <option value="bot_realtime">机器人实时</option>
+            <option value="user_poll">我的私聊</option>
+            <option value="history_poll">历史补拉</option>
+          </select>
+        </label>
         <label className="switch-label">
           <input
             type="checkbox"
@@ -596,10 +737,10 @@ function EventsTab() {
         <button className="ghost-btn" onClick={() => { void loadEvents(); void loadSubscription(); }}>
           立即刷新
         </button>
-        <button className="ghost-btn" disabled={polling} onClick={() => void runHistoryPoll()}>
-          {polling ? "补拉中…" : "立即补拉私聊历史"}
+        <button className="ghost-btn" disabled={polling} onClick={() => void runPollOnce()}>
+          {polling ? "轮询中…" : "立即轮询一次"}
         </button>
-        <span className="count-tag">{events.length} 条事件</span>
+        <span className="count-tag">{events.length} 条消息</span>
         {error && <span className="inline-msg error">{error}</span>}
       </div>
 
@@ -608,6 +749,7 @@ function EventsTab() {
           <thead>
             <tr>
               <th>时间</th>
+              <th>来源</th>
               <th>事件类型</th>
               <th>会话</th>
               <th>发送者</th>
@@ -617,27 +759,35 @@ function EventsTab() {
           <tbody>
             {events.length === 0 && (
               <tr>
-                <td colSpan={5} className="empty-cell">
-                  暂无事件。完成事件订阅配置后，向应用机器人发送一条消息试试。
+                <td colSpan={6} className="empty-cell">
+                  暂无消息。配置好机器人事件订阅、并完成上方飞书账号授权后，两类消息都会出现在这里。
                 </td>
               </tr>
             )}
-            {events.map((event) => (
-              <tr key={event.event_id}>
-                <td className="mono nowrap">{formatTime(event.event_time ?? event.received_at)}</td>
-                <td>
-                  <span className="event-chip">{event.event_type}</span>
-                </td>
-                <td>
-                  {event.chat_type === "p2p" ? "单聊" : event.chat_type === "group" ? "群聊" : "—"}
-                  {event.chat_id && (
-                    <div className="mono sub">{event.chat_id}</div>
-                  )}
-                </td>
-                <td className="mono">{event.sender_id || "—"}</td>
-                <td className="content-cell">{event.content_text || `（${event.message_type || "未知类型"}消息）`}</td>
-              </tr>
-            ))}
+            {events.map((event) => {
+              const source = SOURCE_META[event.source] ?? SOURCE_META.history_poll;
+              return (
+                <tr key={event.event_id}>
+                  <td className="mono nowrap">{formatTime(event.event_time ?? event.received_at)}</td>
+                  <td>
+                    <span className={`source-chip ${event.source}`} title={source.hint}>
+                      {source.label}
+                    </span>
+                  </td>
+                  <td>
+                    <span className="event-chip">{event.event_type}</span>
+                  </td>
+                  <td>
+                    {event.chat_type === "p2p" ? "单聊" : event.chat_type === "group" ? "群聊" : "—"}
+                    {event.chat_id && <div className="mono sub">{event.chat_id}</div>}
+                  </td>
+                  <td className="mono">{event.sender_name || event.sender_id || "—"}</td>
+                  <td className="content-cell">
+                    {event.content_text || `（${event.message_type || "未知类型"}消息）`}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

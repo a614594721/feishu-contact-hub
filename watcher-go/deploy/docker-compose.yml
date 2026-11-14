@@ -1,0 +1,29 @@
+services:
+  lark-watcher:
+    build: ..
+    image: lark-watcher:latest
+    container_name: lark-watcher
+    restart: always
+    env_file:
+      - ./env
+    # 宿主 systemd 的 notify 变量需要显式透传（不带值 = 从 shell 环境继承）
+    environment:
+      - NOTIFY_SOCKET
+      - WATCHDOG_USEC
+    volumes:
+      # 状态持久化：token / 游标 / 去重 journal / 消息输出
+      - ./data:/data
+      # 透传 systemd notify socket（配合宿主上的 systemd unit 或直接 compose up 均无害）
+      - /run/systemd/notify:/run/systemd/notify
+    # compose 模式下 watchdog 不可用时由 healthcheck + restart:always 兜底
+    healthcheck:
+      test: ["CMD", "/lark-watcher", "-mode", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

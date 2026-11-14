@@ -762,117 +762,492 @@ async function persistMessageEvent(data) {
   );
 }
 
-// SECTION: private chat history polling
-// 长连接/Webhook 只推送「实时」事件，进程重启或断线期间飞书不会补发。
-// 这里对已出现过的私聊会话定时调用 im/v1/messages 补拉历史消息，
-// 以 message_id 为幂等键，与实时事件共用同一张表，不重复入库。
+// SECTION: user OAuth (device flow) + 5s private-chat polling
+//
+// 飞书只对「机器人」推实时事件；私聊给「我本人」的消息没有事件通道，
+// 必须用 user_access_token 主动读取。这里用设备流拿到用户授权，之后每 5 秒
+// 枚举我的全部单聊会话并增量拉取，与长连接事件写入同一张 feishu_events 表。
+// 来源不新增列（平台表结构固定），由 event_id 前缀推导：
+//   bot_realtime = 飞书原始 event_id（长连接/Webhook）
+//   user_poll    = user_poll:<message_id>（本段 5 秒轮询）
+//   history_poll = poll:<message_id>（旧版 tenant 兜底补拉）
 
-const POLL_INTERVAL_MS = 60_000;
+const ACCOUNTS_BASE = "https://accounts.feishu.cn";
+const USER_OAUTH_SCOPE = "im:chat:read im:message.p2p_msg:get_as_user offline_access";
+const USER_POLL_INTERVAL_MS = 5_000;
+const USER_POLL_OVERLAP_SEC = 90;
+const USER_POLL_CONCURRENCY = 6;
+const TOKEN_ALERT_HOURS = 72;
+
+const STATE_KEYS = {
+  token: "user_oauth_token",
+  device: "user_oauth_device",
+  cursor: "user_poll_cursor",
+  lastAlert: "user_token_last_alert",
+};
+
+// 状态统一存 app_config 表（key/value），不新增表或列，兼容 broker/legacy/local 三种数据库模式
+async function readState(key) {
+  const rows = await runDatabaseOperation("get_config", () =>
+    getSupabaseClient().from("app_config").select("value").eq("key", key).limit(1),
+  );
+  const raw = rows?.[0]?.value;
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function writeState(key, value) {
+  const now = new Date().toISOString();
+  await runDatabaseOperation("save_config", () =>
+    getSupabaseClient()
+      .from("app_config")
+      .upsert({ key, value: JSON.stringify(value), updated_at: now }, { onConflict: "key" }),
+  );
+}
+
+function basicAuthHeader(config) {
+  return `Basic ${Buffer.from(`${config.app_id}:${config.app_secret}`).toString("base64")}`;
+}
+
+async function postOauthForm(path, form, config) {
+  const response = await fetch(`${ACCOUNTS_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      authorization: basicAuthHeader(config),
+    },
+    body: new URLSearchParams(form).toString(),
+  });
+  const text = await response.text();
+  let data = {};
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = {};
+  }
+  return { status: response.status, data };
+}
+
+async function postOauthJson(path, body, config) {
+  const response = await fetch(`${ACCOUNTS_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      authorization: basicAuthHeader(config),
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  let data = {};
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = {};
+  }
+  return { status: response.status, data };
+}
+
+function tokenFromResponse(data, previous) {
+  return {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || previous?.refresh_token || "",
+    access_expires_at: Date.now() + Number(data.expires_in ?? 7200) * 1000,
+    refresh_expires_at: data.refresh_token_expires_in
+      ? Date.now() + Number(data.refresh_token_expires_in) * 1000
+      : previous?.refresh_expires_at ?? Date.now(),
+    scope: data.scope || previous?.scope || "",
+    open_id: previous?.open_id ?? "",
+    name: previous?.name ?? "",
+  };
+}
+
+let userTokenCache;
+let userAuthState = {
+  status: "idle", // idle | pending | authorized | error | expired
+  error: "",
+  verificationUri: "",
+  userCode: "",
+  expiresAt: null,
+};
+
+async function loadUserToken() {
+  if (userTokenCache !== undefined) return userTokenCache;
+  userTokenCache = await readState(STATE_KEYS.token);
+  return userTokenCache;
+}
+
+async function saveUserToken(token) {
+  userTokenCache = token;
+  await writeState(STATE_KEYS.token, token);
+}
+
+async function fetchUserInfo(accessToken) {
+  const response = await fetch(`${FEISHU_BASE}/authen/v1/user_info`, {
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  const payload = await response.json().catch(() => null);
+  return {
+    open_id: payload?.data?.open_id ?? "",
+    name: payload?.data?.name ?? "",
+  };
+}
+
+// 提前 5 分钟刷新；refresh_token 滚动续期，正常轮询下不会过期
+async function ensureUserAccessToken(force = false) {
+  const token = await loadUserToken();
+  if (!token?.access_token) return "";
+  if (!force && token.access_expires_at - Date.now() > 5 * 60 * 1000) {
+    return token.access_token;
+  }
+  if (!token.refresh_token) {
+    throw new Error("无 refresh_token：请在开放平台开启「刷新 user_access_token」并发布版本");
+  }
+  const config = await loadConfig();
+  const { status, data } = await postOauthJson(
+    "/oauth/v3/token",
+    { grant_type: "refresh_token", refresh_token: token.refresh_token },
+    config,
+  );
+  if (!data.access_token) {
+    throw new Error(
+      `刷新 user token 失败（HTTP ${status}）：${data.error_description ?? data.error ?? "无 access_token"}`,
+    );
+  }
+  const next = tokenFromResponse(data, token);
+  await saveUserToken(next);
+  return next.access_token;
+}
+
+async function userApiGet(path, params, accessToken, allowRefresh = true) {
+  const url = new URL(`${FEISHU_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, String(value));
+  }
+  const response = await fetch(url, {
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  const payload = await response.json().catch(() => null);
+  if (
+    allowRefresh &&
+    (response.status === 401 || payload?.code === 99991661 || payload?.code === 99991663)
+  ) {
+    const fresh = await ensureUserAccessToken(true);
+    if (fresh) return userApiGet(path, params, fresh, false);
+  }
+  if (payload?.code !== 0) {
+    throw new FeishuApiError(payload?.code ?? -1, payload?.msg ?? "飞书接口调用失败");
+  }
+  return payload?.data ?? {};
+}
+
+async function listUserP2PChats(accessToken) {
+  const chats = [];
+  let pageToken = "";
+  for (let page = 0; page < 20; page += 1) {
+    const params = {
+      user_id_type: "open_id",
+      sort_type: "ByActiveTimeDesc",
+      types: "p2p",
+      page_size: "100",
+    };
+    if (pageToken) params.page_token = pageToken;
+    const data = await userApiGet("/im/v1/chats", params, accessToken);
+    for (const item of data.items ?? []) {
+      if (item.chat_id) chats.push({ chat_id: item.chat_id, name: item.name ?? "" });
+    }
+    if (!data.has_more || !data.page_token) break;
+    pageToken = data.page_token;
+  }
+  return chats;
+}
+
+async function listUserChatMessages(accessToken, chatId, startUnix, endUnix) {
+  const items = [];
+  let pageToken = "";
+  for (let page = 0; page < 10; page += 1) {
+    const params = {
+      container_id_type: "chat",
+      container_id: chatId,
+      sort_type: "ByCreateTimeAsc",
+      page_size: "50",
+      start_time: String(startUnix),
+      end_time: String(endUnix),
+      card_msg_content_type: "raw_card_content",
+      with_sender_name: "true",
+    };
+    if (pageToken) params.page_token = pageToken;
+    const data = await userApiGet("/im/v1/messages", params, accessToken);
+    items.push(...(data.items ?? []));
+    if (!data.has_more || !data.page_token) break;
+    pageToken = data.page_token;
+  }
+  return items;
+}
+
+// 设备流授权：前端点一次「开始授权」，后端自动轮询到用户扫码完成
+async function startUserAuth() {
+  const config = await loadConfig();
+  if (!config.app_id || !config.app_secret) {
+    throw new BadRequestError("请先在「设置」中填写飞书 App ID 与 App Secret");
+  }
+  const { status, data } = await postOauthForm(
+    "/oauth/v1/device_authorization",
+    { client_id: config.app_id, scope: USER_OAUTH_SCOPE },
+    config,
+  );
+  if (status >= 400 || !data.device_code) {
+    throw new FeishuApiError(
+      data?.code ?? -1,
+      data?.error_description ?? data?.error ?? `设备授权失败（HTTP ${status}）`,
+    );
+  }
+  const device = {
+    device_code: data.device_code,
+    verification_uri: data.verification_uri ?? `${ACCOUNTS_BASE}/oauth/v1/device/verify`,
+    user_code: data.user_code ?? "",
+    expires_at: Date.now() + Number(data.expires_in ?? 600) * 1000,
+    interval_ms: Math.max(Number(data.interval ?? 5), 3) * 1000,
+  };
+  await writeState(STATE_KEYS.device, device);
+  userAuthState = {
+    status: "pending",
+    error: "",
+    verificationUri: device.verification_uri,
+    userCode: device.user_code,
+    expiresAt: new Date(device.expires_at).toISOString(),
+  };
+  void waitForUserAuth(device, config).catch((error) => {
+    userAuthState = { ...userAuthState, status: "error", error: String(error?.message ?? error) };
+  });
+  return userAuthState;
+}
+
+async function waitForUserAuth(device, config) {
+  while (Date.now() < device.expires_at) {
+    await new Promise((resolve) => setTimeout(resolve, device.interval_ms));
+    const { data } = await postOauthForm(
+      "/oauth/v3/token",
+      {
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+        device_code: device.device_code,
+        client_id: config.app_id,
+      },
+      config,
+    );
+    if (data.access_token) {
+      const token = tokenFromResponse(data, null);
+      const info = await fetchUserInfo(token.access_token).catch(() => ({ open_id: "", name: "" }));
+      token.open_id = info.open_id;
+      token.name = info.name;
+      await saveUserToken(token);
+      await writeState(STATE_KEYS.device, null);
+      // 首次授权建立当前时间基线，不回溯历史消息
+      await writeState(STATE_KEYS.cursor, Math.floor(Date.now() / 1000));
+      userAuthState = {
+        status: "authorized",
+        error: "",
+        verificationUri: "",
+        userCode: "",
+        expiresAt: null,
+      };
+      return;
+    }
+    if (data.error === "slow_down") {
+      device.interval_ms += 5_000;
+    } else if (data.error && data.error !== "authorization_pending") {
+      userAuthState = {
+        ...userAuthState,
+        status: "error",
+        error: `${data.error} ${data.error_description ?? ""}`.trim(),
+      };
+      return;
+    }
+  }
+  userAuthState = { ...userAuthState, status: "expired", error: "授权已过期，请重新发起" };
+}
+
+function userAuthSummary() {
+  const token = userTokenCache;
+  const authorized = Boolean(token?.access_token);
+  const hoursLeft = authorized
+    ? Math.max(0, (token.refresh_expires_at - Date.now()) / 3_600_000)
+    : 0;
+  return {
+    ...userAuthState,
+    status: authorized && userAuthState.status === "idle" ? "authorized" : userAuthState.status,
+    authorized,
+    openId: token?.open_id ?? "",
+    userName: token?.name ?? "",
+    accessExpiresAt: authorized ? new Date(token.access_expires_at).toISOString() : null,
+    refreshExpiresAt: authorized ? new Date(token.refresh_expires_at).toISOString() : null,
+    refreshHoursLeft: Math.round(hoursLeft * 10) / 10,
+    needAlert: authorized && hoursLeft < TOKEN_ALERT_HOURS,
+  };
+}
+
+async function alertTokenExpiry(summary) {
+  if (!summary.needAlert) return;
+  const last = Number(await readState(STATE_KEYS.lastAlert)) || 0;
+  if (Date.now() - last < 12 * 3_600_000) return;
+  await writeState(STATE_KEYS.lastAlert, Date.now());
+  const text = `[飞书消息台] user refresh_token 剩余 ${summary.refreshHoursLeft} 小时，请到「消息订阅」页重新扫码授权，否则 5 秒私聊轮询会静默停止。`;
+  console.warn(text);
+  const webhook = process.env.ALERT_WEBHOOK ?? "";
+  if (webhook) {
+    try {
+      await fetch(webhook, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ msgtype: "text", text: { content: text } }),
+      });
+    } catch (error) {
+      console.error("token alert webhook failed:", error?.message ?? error);
+    }
+  }
+}
+
+// SECTION: 5s private-chat polling (user identity)
+
+const POLL_INTERVAL_MS = USER_POLL_INTERVAL_MS;
 let pollTimer = null;
 let pollRunning = false;
 const pollStatus = {
   enabled: true,
   intervalMs: POLL_INTERVAL_MS,
+  mode: "idle", // idle | user_oauth
   lastRunAt: null,
   chats: 0,
   scanned: 0,
   inserted: 0,
   error: "",
+  userAuthorized: false,
+  userName: "",
+  refreshHoursLeft: 0,
+  tokenAlert: "",
 };
+
+async function knownMessageIds(chatId) {
+  const rows = await runDatabaseOperation("list_events", () =>
+    getSupabaseClient()
+      .from("feishu_events")
+      .select("event_id, raw")
+      .eq("chat_id", chatId)
+      .limit(500),
+  );
+  const ids = new Set();
+  for (const row of rows ?? []) {
+    if (row.event_id) {
+      ids.add(row.event_id);
+      const match = /^(?:user_poll|poll):(.+)$/.exec(row.event_id);
+      if (match) ids.add(match[1]);
+    }
+    const mid = row.raw?.message?.message_id;
+    if (mid) ids.add(mid);
+  }
+  return ids;
+}
+
+async function persistUserMessage(msg, chat, myOpenId) {
+  const messageId = msg.message_id;
+  if (!messageId || msg.deleted) return false;
+  if (myOpenId && msg.sender?.id === myOpenId) return false; // 只收别人发给我的
+  const eventId = `user_poll:${messageId}`;
+  const raw = typeof msg.body?.content === "string" ? msg.body.content : "";
+  const createTime = Number(msg.create_time);
+  await runDatabaseOperation("insert_event", () =>
+    getSupabaseClient().from("feishu_events").insert({
+      event_id: eventId,
+      event_type: "im.message.receive_v1",
+      chat_id: msg.chat_id ?? chat.chat_id,
+      chat_type: "p2p",
+      sender_id: msg.sender?.id ?? "",
+      sender_name: msg.sender_name ?? msg.sender?.name ?? "",
+      message_type: msg.msg_type ?? "",
+      content: raw.slice(0, 4000),
+      content_text: extractMessageText(msg.msg_type ?? "", raw).slice(0, 1000),
+      event_time:
+        Number.isFinite(createTime) && createTime > 0
+          ? new Date(createTime).toISOString()
+          : null,
+      raw: { source: "user_poll", chat_name: chat.name, message: msg },
+    }),
+  );
+  return true;
+}
 
 async function pollPrivateChatsOnce() {
   if (pollRunning) return pollStatus;
   pollRunning = true;
   const runAt = new Date().toISOString();
   try {
-    const config = await loadConfig();
-    if (!config.app_id || !config.app_secret) {
-      // 未配置凭证：保持静默，不算失败
+    const token = await loadUserToken();
+    if (!token?.access_token) {
+      Object.assign(pollStatus, {
+        mode: "idle",
+        lastRunAt: runAt,
+        chats: 0,
+        scanned: 0,
+        inserted: 0,
+        error: "",
+        userAuthorized: false,
+      });
       return pollStatus;
     }
 
-    // 1) 从已入库事件里收集已知私聊会话（飞书没有"枚举私聊会话"的接口）
-    const rows = await runDatabaseOperation("list_known_chats", () =>
-      getSupabaseClient().from("feishu_events").select("chat_id, chat_type").limit(500),
-    );
-    const chatIds = [
-      ...new Set(
-        (rows ?? [])
-          .filter((row) => row.chat_id && row.chat_type === "p2p")
-          .map((row) => row.chat_id),
-      ),
-    ];
+    const summary = userAuthSummary();
+    void alertTokenExpiry(summary);
+    const accessToken = await ensureUserAccessToken();
+    const chats = await listUserP2PChats(accessToken);
 
-    const client = getSdkClient(config);
+    const cursor = Number(await readState(STATE_KEYS.cursor)) || Math.floor(Date.now() / 1000);
+    const startUnix = Math.max(0, cursor - USER_POLL_OVERLAP_SEC);
+    const endUnix = Math.floor(Date.now() / 1000) + 60;
+
     let scanned = 0;
     let inserted = 0;
-
-    for (const chatId of chatIds) {
-      const data = unwrapSdkResponse(
-        await client.im.v1.message.list({
-          params: {
-            container_id_type: "chat",
-            container_id: chatId,
-            page_size: 20,
-            // 默认按创建时间正序（返回最早的一批），会漏掉断线期间的最新消息
-            sort_type: "ByCreateTimeDesc",
-          },
-        }),
-      );
-      const items = data.items ?? [];
-      scanned += items.length;
-
-      // 2) 该会话已入库的标识集合：既含实时事件的 message_id，也含此前补拉的 event_id
-      const known = await runDatabaseOperation("list_chat_events", () =>
-        getSupabaseClient()
-          .from("feishu_events")
-          .select("id, event_id, raw")
-          .eq("chat_id", chatId)
-          .limit(200),
-      );
-      const knownIds = new Set();
-      for (const row of known ?? []) {
-        if (row.event_id) knownIds.add(row.event_id);
-        const mid = row.raw?.message?.message_id;
-        if (mid) knownIds.add(mid);
+    const queue = [...chats];
+    const workerCount = Math.min(USER_POLL_CONCURRENCY, Math.max(queue.length, 1));
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (queue.length > 0) {
+        const chat = queue.shift();
+        if (!chat) break;
+        try {
+          const messages = await listUserChatMessages(accessToken, chat.chat_id, startUnix, endUnix);
+          scanned += messages.length;
+          if (messages.length === 0) continue;
+          const known = await knownMessageIds(chat.chat_id);
+          for (const msg of messages) {
+            if (known.has(msg.message_id) || known.has(`user_poll:${msg.message_id}`)) continue;
+            if (await persistUserMessage(msg, chat, token.open_id)) {
+              known.add(msg.message_id);
+              inserted += 1;
+            }
+          }
+        } catch (error) {
+          console.error(`poll chat ${chat.chat_id} failed:`, error?.message ?? error);
+        }
       }
+    });
+    await Promise.all(workers);
 
-      for (const msg of items) {
-        const messageId = msg.message_id;
-        if (!messageId || msg.deleted) continue;
-        if (knownIds.has(messageId) || knownIds.has(`poll:${messageId}`)) continue;
-
-        const content = typeof msg.body?.content === "string" ? msg.body.content : "";
-        const createTime = Number(msg.create_time);
-        await runDatabaseOperation("insert_polled_event", () =>
-          getSupabaseClient().from("feishu_events").insert({
-            event_id: `poll:${messageId}`,
-            event_type: "im.message.receive_v1",
-            chat_id: msg.chat_id ?? chatId,
-            chat_type: msg.chat_type ?? "p2p",
-            sender_id: msg.sender?.id ?? "",
-            sender_name: "",
-            message_type: msg.msg_type ?? "",
-            content: content.slice(0, 4000),
-            content_text: extractMessageText(msg.msg_type ?? "", content).slice(0, 1000),
-            event_time:
-              Number.isFinite(createTime) && createTime > 0
-                ? new Date(createTime).toISOString()
-                : null,
-            raw: { source: "history_poll", message: msg },
-          }),
-        );
-        knownIds.add(messageId);
-        inserted += 1;
-      }
-    }
-
+    await writeState(STATE_KEYS.cursor, Math.floor(Date.now() / 1000));
     Object.assign(pollStatus, {
+      mode: "user_oauth",
       lastRunAt: runAt,
-      chats: chatIds.length,
+      chats: chats.length,
       scanned,
       inserted,
       error: "",
+      userAuthorized: true,
+      userName: token.name ?? "",
+      refreshHoursLeft: summary.refreshHoursLeft,
+      tokenAlert: summary.needAlert
+        ? `refresh_token 仅剩 ${summary.refreshHoursLeft} 小时，请重新扫码授权`
+        : "",
     });
   } catch (error) {
     pollStatus.lastRunAt = runAt;
@@ -886,9 +1261,16 @@ async function pollPrivateChatsOnce() {
 
 function startPrivateChatPolling() {
   if (pollTimer) clearInterval(pollTimer);
-  // 启动 15 秒后先补拉一次，之后按固定间隔执行
-  setTimeout(() => void pollPrivateChatsOnce(), 15_000);
+  // 启动时加载已有 token，让状态卡片立即显示授权情况
+  void loadUserToken().catch(() => null);
+  setTimeout(() => void pollPrivateChatsOnce(), 3_000);
   pollTimer = setInterval(() => void pollPrivateChatsOnce(), POLL_INTERVAL_MS);
+}
+
+function deriveEventSource(eventId) {
+  if (typeof eventId === "string" && eventId.startsWith("user_poll:")) return "user_poll";
+  if (typeof eventId === "string" && eventId.startsWith("poll:")) return "history_poll";
+  return "bot_realtime";
 }
 
 // Webhook 事件分发器：Encrypt Key 解密、Verification Token 验签、
@@ -1187,11 +1569,24 @@ async function handleApiRoute(request, response, url) {
       error: subscriptionStatus.error,
       webhookPath: "/webhook/feishu",
       poll: { ...pollStatus },
+      userAuth: userAuthSummary(),
     });
     return;
   }
 
-  // 手动触发一次私聊历史消息补拉（便于排查与即时回填）
+  // user 身份设备流授权：拿到 user_access_token 后即可 5 秒轮询「私聊给我本人」的消息
+  if (pathname === "/api/user-auth" && method === "GET") {
+    sendJson(response, 200, userAuthSummary());
+    return;
+  }
+
+  if (pathname === "/api/user-auth/start" && method === "POST") {
+    const auth = await startUserAuth();
+    sendJson(response, 200, { ok: true, auth });
+    return;
+  }
+
+  // 手动触发一次私聊消息轮询（便于排查与即时回填）
   if (pathname === "/api/poll" && method === "POST") {
     const result = await pollPrivateChatsOnce();
     sendJson(response, 200, { ok: !result.error, poll: { ...result } });
@@ -1246,6 +1641,9 @@ async function handleApiRoute(request, response, url) {
   if (pathname === "/api/events" && method === "GET") {
     const limit = Math.min(Number(url.searchParams.get("limit") ?? 50) || 50, 200);
     const eventType = url.searchParams.get("event_type") ?? "";
+    const source = url.searchParams.get("source") ?? "";
+    // 按来源筛选时先多取一些再过滤，避免结果被 limit 截断
+    const queryLimit = source && source !== "all" ? 200 : limit;
     let query = getSupabaseClient()
       .from("feishu_events")
       .select("id, event_id, event_type, chat_id, chat_type, sender_id, sender_name, message_type, content_text, event_time, received_at")
@@ -1253,12 +1651,16 @@ async function handleApiRoute(request, response, url) {
       // 时间相同则按入库 id 倒序，保证列表始终呈现真实的时间线
       .order("event_time", { ascending: false })
       .order("id", { ascending: false })
-      .limit(limit);
+      .limit(queryLimit);
     if (eventType) {
       query = query.eq("event_type", eventType);
     }
     const rows = await runDatabaseOperation("list_events", () => query);
-    sendJson(response, 200, { events: rows ?? [] });
+    const events = (rows ?? [])
+      .map((row) => ({ ...row, source: deriveEventSource(row.event_id) }))
+      .filter((row) => !source || source === "all" || row.source === source)
+      .slice(0, limit);
+    sendJson(response, 200, { events });
     return;
   }
 
@@ -1293,8 +1695,14 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://qwenwork.local");
     const method = request.method ?? "GET";
 
-    if (url.pathname === "/healthz" || url.pathname === "/api/health") {
+    if (url.pathname === "/healthz") {
       sendJson(response, 200, { status: "ok", database: databaseMode });
+      return;
+    }
+
+    // runtime 契约：/api/health 只回状态字段，诊断信息放 /healthz
+    if (url.pathname === "/api/health") {
+      sendJson(response, 200, { status: "ok" });
       return;
     }
 
@@ -1365,6 +1773,6 @@ server.listen(port, host, () => {
   console.log(`QW Page server listening on http://${host}:${port}`);
   // 启动时若已配置凭证，自动建立飞书长连接订阅（失败不影响 HTTP 服务）
   void restartEventSubscription().catch(() => {});
-  // 私聊历史消息定时补拉：覆盖长连接断线期间漏收的消息
+  // 私聊消息 5 秒轮询（user 身份，需在「消息订阅」页完成一次扫码授权）
   startPrivateChatPolling();
 });

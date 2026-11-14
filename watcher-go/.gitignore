@@ -1,0 +1,19 @@
+# 运行时凭证与状态（严禁入库）
+/token.json
+/cursor
+/seen.journal
+*.jsonl
+/data/
+/testdata/
+/notify.sock
+*.log
+
+# 本地环境覆盖文件（deploy/env 是模板，需保留）
+/.env
+/env.local
+
+# 编译产物
+/lark-p2p-watcher
+/lark-watcher
+*.test
+*.out
