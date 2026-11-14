@@ -433,6 +433,9 @@ function configSummary(config) {
 // SECTION: feishu api client (official SDK)
 
 const FEISHU_ERROR_MESSAGES = {
+  40004: "应用没有该部门的通讯录数据权限，请在飞书开放平台「权限管理 → 数据权限」中把部门加入可见范围，并发布版本后重试",
+  40006: "应用没有该接口的调用权限，请在飞书开放平台开通对应权限并发布版本",
+  99992402: "请求参数校验失败，请检查分页大小等参数是否超出接口上限",
   99991661: "App ID 不存在，请检查飞书应用凭证",
   99991663: "App Secret 不正确，请检查飞书应用凭证",
   99991668: "App ID 或 App Secret 缺失",
@@ -460,20 +463,55 @@ function unwrapSdkResponse(response) {
   return response.data ?? {};
 }
 
+// SDK 内部的 token 缓存是模块级单例、无法清理。这里改用可清空的托管缓存：
+// 飞书 tenant_access_token 在签发时固化权限快照，改完权限后旧 token 仍会被判 40004，
+// 若不能清缓存就只能重启进程或等 2 小时。托管后可在权限类错误时自动重取。
+class MemoryTokenCache {
+  constructor() {
+    this.values = new Map();
+  }
+  keyOf(key, options) {
+    const name = String(key);
+    return options?.namespace ? `${options.namespace}/${name}` : name;
+  }
+  async get(key, options) {
+    const cacheKey = this.keyOf(key, options);
+    const entry = this.values.get(cacheKey);
+    if (!entry) return undefined;
+    if (entry.expiredTime && entry.expiredTime - Date.now() <= 0) {
+      this.values.delete(cacheKey);
+      return undefined;
+    }
+    return entry.value;
+  }
+  async set(key, value, expiredTime, options) {
+    this.values.set(this.keyOf(key, options), { value, expiredTime });
+    return true;
+  }
+  clear() {
+    this.values.clear();
+  }
+}
+
+// 这些错误码意味着凭证/权限刚刚变更，旧 token 已失效，值得清缓存重试一次
+const RETRYABLE_CREDENTIAL_CODES = new Set([40004, 40006, 99991661, 99991663, 99991668, 99991672]);
+
 // SDK Client 缓存：同一凭证复用实例，token 获取/续期由 SDK 自动处理
-let sdkClientCache = { key: "", client: null };
+let sdkClientCache = { key: "", client: null, cache: null };
 
 function getSdkClient(config) {
   const key = `${config.app_id}\n${config.app_secret}`;
   if (sdkClientCache.key === key && sdkClientCache.client) {
     return sdkClientCache.client;
   }
+  const cache = new MemoryTokenCache();
   const client = new lark.Client({
     appId: config.app_id,
     appSecret: config.app_secret,
     loggerLevel: lark.LoggerLevel.warn,
+    cache,
   });
-  sdkClientCache = { key, client };
+  sdkClientCache = { key, client, cache };
   return client;
 }
 
@@ -490,7 +528,7 @@ async function listAllDepartments(client) {
         params: {
           department_id_type: "department_id",
           fetch_child: true,
-          page_size: 100,
+          page_size: 50,
           ...(pageToken ? { page_token: pageToken } : {}),
         },
       }),
@@ -518,7 +556,7 @@ async function listUsersByDepartment(client, departmentId) {
         params: {
           department_id: departmentId,
           department_id_type: "department_id",
-          page_size: 100,
+          page_size: 50,
           user_id_type: "open_id",
           ...(pageToken ? { page_token: pageToken } : {}),
         },
@@ -534,7 +572,7 @@ async function listUsersByDepartment(client, departmentId) {
 
 // SECTION: contact sync
 
-async function syncContacts() {
+async function syncContactsOnce() {
   const config = await loadConfig();
   if (!config.app_id || !config.app_secret) {
     throw new BadRequestError("请先在「设置」中填写飞书 App ID 与 App Secret");
@@ -597,6 +635,27 @@ async function syncContacts() {
     userCount: users.length,
     syncedAt: now,
   };
+}
+
+// 权限/凭证类失败时清掉 token 缓存重试一次：飞书改完权限后旧 token 仍带旧权限快照，
+// 不清缓存就只能重启进程或等 2 小时，这里让它在一次请求内自愈。
+async function syncContacts() {
+  try {
+    return await syncContactsOnce();
+  } catch (error) {
+    const normalized = normalizeFeishuError(error);
+    if (
+      normalized instanceof FeishuApiError &&
+      RETRYABLE_CREDENTIAL_CODES.has(normalized.feishuCode)
+    ) {
+      console.warn(
+        `feishu api ${normalized.feishuCode} on sync: clearing token cache and retrying once`,
+      );
+      sdkClientCache.cache?.clear();
+      return await syncContactsOnce();
+    }
+    throw error;
+  }
 }
 
 async function testFeishuConnection() {
@@ -869,25 +928,47 @@ async function readJsonBody(request) {
   }
 }
 
+// SDK 在 HTTP 4xx/5xx 时抛的是 AxiosError，飞书业务码在 response.data.code 里。
+// 不转换的话会落到兜底的 500 internal_error，前端只能看到「内部错误」，
+// 这里统一归一化成 FeishuApiError，让真实业务码透出到界面。
+function normalizeFeishuError(error) {
+  if (error instanceof FeishuApiError) return error;
+  const payload = error?.response?.data;
+  if (payload && typeof payload.code === "number" && payload.code !== 0) {
+    return new FeishuApiError(payload.code, payload.msg ?? "飞书接口调用失败");
+  }
+  if (error?.code === "ERR_BAD_REQUEST" || error?.code === "ERR_BAD_RESPONSE") {
+    return new FeishuApiError(-1, error.message ?? "飞书接口调用失败");
+  }
+  return error;
+}
+
 function handleRouteError(response, error) {
+  const failure = normalizeFeishuError(error);
   const traceId = `t-${Math.random().toString(36).slice(2, 10)}`;
-  if (error instanceof DatabaseUnavailableError) {
+  if (failure instanceof DatabaseUnavailableError) {
     sendJson(response, 503, { error: "database_unavailable", traceId });
     return;
   }
-  if (error instanceof DatabaseOperationError) {
+  if (failure instanceof DatabaseOperationError) {
     console.error(
-      `traceId=${traceId} category=${error.diagnostic.category} code=${error.diagnostic.code} operation=${error.diagnostic.operation}`,
+      `traceId=${traceId} category=${failure.diagnostic.category} code=${failure.diagnostic.code} operation=${failure.diagnostic.operation}`,
     );
     sendJson(response, 500, { error: "operation_failed", traceId });
     return;
   }
-  if (error instanceof BadRequestError) {
-    sendJson(response, 400, { error: "bad_request", message: error.message, traceId });
+  if (failure instanceof BadRequestError) {
+    sendJson(response, 400, { error: "bad_request", message: failure.message, traceId });
     return;
   }
-  if (error instanceof FeishuApiError) {
-    sendJson(response, 502, { error: "feishu_api_error", message: error.clientMessage(), traceId });
+  if (failure instanceof FeishuApiError) {
+    console.error(`traceId=${traceId} feishu_code=${failure.feishuCode} ${failure.message}`);
+    sendJson(response, 502, {
+      error: "feishu_api_error",
+      message: failure.clientMessage(),
+      feishuCode: failure.feishuCode,
+      traceId,
+    });
     return;
   }
   console.error(`traceId=${traceId} unexpected route error`);
