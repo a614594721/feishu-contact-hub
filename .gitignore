@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.qw-pages/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+
+# 本地运行时数据（含飞书凭证明文，禁止入库）
+data/

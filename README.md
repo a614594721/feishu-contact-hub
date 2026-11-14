@@ -1,1 +1,0 @@
-# feishu-contact-hub\n\nWrite permission verified via CodeBuddy GitHub Connector.\n
