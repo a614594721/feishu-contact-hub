@@ -375,6 +375,10 @@ textarea {
   min-width: 200px;
 }
 
+.search-input {
+  min-width: 310px;
+}
+
 .search-input::placeholder {
   color: var(--ink-faint);
 }
@@ -445,6 +449,29 @@ tbody tr:hover {
 .mono {
   font-family: var(--mono);
   font-size: 0.82rem;
+}
+
+/* 可点击复制的单元格 */
+.copy-cell {
+  background: none;
+  border: 1px dashed rgba(120, 150, 220, 0.35);
+  border-radius: 0.35rem;
+  padding: 0.1rem 0.4rem;
+  color: var(--ink);
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
+  white-space: nowrap;
+}
+
+.copy-cell:hover {
+  border-color: rgba(78, 131, 255, 0.75);
+  background: rgba(78, 131, 255, 0.12);
+}
+
+.copy-cell.copied {
+  border-color: rgba(74, 222, 128, 0.7);
+  background: rgba(74, 222, 128, 0.14);
+  color: #86efac;
 }
 
 .nowrap {

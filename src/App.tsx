@@ -185,6 +185,45 @@ export function App() {
 
 /* SECTION: contacts tab */
 
+/** 可点击复制的文本（用于 user_id 这类需要粘贴到别处的短标识） */
+function CopyText({ value }: { value?: string }) {
+  const [copied, setCopied] = useState(false);
+
+  if (!value) return <span className="mono">—</span>;
+
+  const handleCopy = async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        const area = document.createElement("textarea");
+        area.value = value;
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        document.body.appendChild(area);
+        area.select();
+        document.execCommand("copy");
+        area.remove();
+      }
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      className={`copy-cell mono${copied ? " copied" : ""}`}
+      onClick={handleCopy}
+      title={`点击复制：${value}`}
+    >
+      {copied ? "已复制" : value}
+    </button>
+  );
+}
+
 function ContactsTab({
   lastSyncAt,
   onSynced,
@@ -299,7 +338,7 @@ function ContactsTab({
       <div className="filter-row">
         <input
           className="search-input"
-          placeholder="搜索姓名 / 邮箱 / 职位…"
+          placeholder="搜索姓名 / 用户 ID / 邮箱 / 职位"
           value={search}
           onChange={(event) => setSearch(event.target.value)}
         />
@@ -323,6 +362,7 @@ function ContactsTab({
           <thead>
             <tr>
               <th>姓名</th>
+              <th>用户 ID</th>
               <th>职位</th>
               <th>部门</th>
               <th>邮箱</th>
@@ -333,7 +373,7 @@ function ContactsTab({
           <tbody>
             {users.length === 0 && (
               <tr>
-                <td colSpan={6} className="empty-cell">
+                <td colSpan={7} className="empty-cell">
                   {configured ? "暂无数据，点击「同步飞书通讯录」拉取人员" : "请先完成应用配置"}
                 </td>
               </tr>
@@ -349,6 +389,9 @@ function ContactsTab({
                     </span>
                   )}
                   <span>{user.name || "（未命名）"}</span>
+                </td>
+                <td>
+                  <CopyText value={user.user_id} />
                 </td>
                 <td>{user.job_title || "—"}</td>
                 <td>

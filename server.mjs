@@ -167,6 +167,9 @@ function matchesCondition(row, condition) {
     const haystack = Array.isArray(value) ? value.map(String) : [String(value ?? "")];
     return targets.every((target) => haystack.includes(String(target)));
   }
+  if (condition.type === "or") {
+    return condition.group.some((nested) => matchesCondition(row, nested));
+  }
   return true;
 }
 
@@ -212,17 +215,20 @@ class LocalQuery {
   }
 
   // 支持 "name.ilike.%x%,email.ilike.%y%" 这类 PostgREST 或表达式
+  // 注意：or 内部的字段之间是「或」关系，不能混进 conditions 的「与」序列
   or(expression) {
     const parts = String(expression).split(/,(?=[A-Za-z_][A-Za-z0-9_]*\.(?:ilike|eq)\.)/);
+    const group = [];
     for (const part of parts) {
       const match = /^([A-Za-z_][A-Za-z0-9_]*)\.(ilike|eq)\.([\s\S]*)$/.exec(part.trim());
       if (!match) continue;
-      this.conditions.push({
+      group.push({
         type: match[2] === "ilike" ? "ilike" : "eq",
         column: match[1],
         value: match[3],
       });
     }
+    if (group.length > 0) this.conditions.push({ type: "or", group });
     return this;
   }
 
@@ -1089,7 +1095,8 @@ async function handleApiRoute(request, response, url) {
       .limit(500);
 
     if (search) {
-      query = query.or(`name.ilike.%${escapeLike(search)}%,email.ilike.%${escapeLike(search)}%,job_title.ilike.%${escapeLike(search)}%`);
+      const kw = escapeLike(search);
+      query = query.or(`name.ilike.%${kw}%,email.ilike.%${kw}%,job_title.ilike.%${kw}%,user_id.ilike.%${kw}%,open_id.ilike.%${kw}%`);
     }
     if (department) {
       query = query.contains("department_ids", [department]);
