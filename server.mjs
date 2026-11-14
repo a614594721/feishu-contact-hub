@@ -762,6 +762,135 @@ async function persistMessageEvent(data) {
   );
 }
 
+// SECTION: private chat history polling
+// 长连接/Webhook 只推送「实时」事件，进程重启或断线期间飞书不会补发。
+// 这里对已出现过的私聊会话定时调用 im/v1/messages 补拉历史消息，
+// 以 message_id 为幂等键，与实时事件共用同一张表，不重复入库。
+
+const POLL_INTERVAL_MS = 60_000;
+let pollTimer = null;
+let pollRunning = false;
+const pollStatus = {
+  enabled: true,
+  intervalMs: POLL_INTERVAL_MS,
+  lastRunAt: null,
+  chats: 0,
+  scanned: 0,
+  inserted: 0,
+  error: "",
+};
+
+async function pollPrivateChatsOnce() {
+  if (pollRunning) return pollStatus;
+  pollRunning = true;
+  const runAt = new Date().toISOString();
+  try {
+    const config = await loadConfig();
+    if (!config.app_id || !config.app_secret) {
+      // 未配置凭证：保持静默，不算失败
+      return pollStatus;
+    }
+
+    // 1) 从已入库事件里收集已知私聊会话（飞书没有"枚举私聊会话"的接口）
+    const rows = await runDatabaseOperation("list_known_chats", () =>
+      getSupabaseClient().from("feishu_events").select("chat_id, chat_type").limit(500),
+    );
+    const chatIds = [
+      ...new Set(
+        (rows ?? [])
+          .filter((row) => row.chat_id && row.chat_type === "p2p")
+          .map((row) => row.chat_id),
+      ),
+    ];
+
+    const client = getSdkClient(config);
+    let scanned = 0;
+    let inserted = 0;
+
+    for (const chatId of chatIds) {
+      const data = unwrapSdkResponse(
+        await client.im.v1.message.list({
+          params: {
+            container_id_type: "chat",
+            container_id: chatId,
+            page_size: 20,
+            // 默认按创建时间正序（返回最早的一批），会漏掉断线期间的最新消息
+            sort_type: "ByCreateTimeDesc",
+          },
+        }),
+      );
+      const items = data.items ?? [];
+      scanned += items.length;
+
+      // 2) 该会话已入库的标识集合：既含实时事件的 message_id，也含此前补拉的 event_id
+      const known = await runDatabaseOperation("list_chat_events", () =>
+        getSupabaseClient()
+          .from("feishu_events")
+          .select("id, event_id, raw")
+          .eq("chat_id", chatId)
+          .limit(200),
+      );
+      const knownIds = new Set();
+      for (const row of known ?? []) {
+        if (row.event_id) knownIds.add(row.event_id);
+        const mid = row.raw?.message?.message_id;
+        if (mid) knownIds.add(mid);
+      }
+
+      for (const msg of items) {
+        const messageId = msg.message_id;
+        if (!messageId || msg.deleted) continue;
+        if (knownIds.has(messageId) || knownIds.has(`poll:${messageId}`)) continue;
+
+        const content = typeof msg.body?.content === "string" ? msg.body.content : "";
+        const createTime = Number(msg.create_time);
+        await runDatabaseOperation("insert_polled_event", () =>
+          getSupabaseClient().from("feishu_events").insert({
+            event_id: `poll:${messageId}`,
+            event_type: "im.message.receive_v1",
+            chat_id: msg.chat_id ?? chatId,
+            chat_type: msg.chat_type ?? "p2p",
+            sender_id: msg.sender?.id ?? "",
+            sender_name: "",
+            message_type: msg.msg_type ?? "",
+            content: content.slice(0, 4000),
+            content_text: extractMessageText(msg.msg_type ?? "", content).slice(0, 1000),
+            event_time:
+              Number.isFinite(createTime) && createTime > 0
+                ? new Date(createTime).toISOString()
+                : null,
+            raw: { source: "history_poll", message: msg },
+          }),
+        );
+        knownIds.add(messageId);
+        inserted += 1;
+      }
+    }
+
+    Object.assign(pollStatus, {
+      lastRunAt: runAt,
+      chats: chatIds.length,
+      scanned,
+      inserted,
+      error: "",
+    });
+  } catch (error) {
+    pollStatus.lastRunAt = runAt;
+    pollStatus.error = String(error?.message ?? error).slice(0, 200);
+    console.error("private chat poll failed:", pollStatus.error);
+  } finally {
+    pollRunning = false;
+  }
+  return pollStatus;
+}
+
+function startPrivateChatPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  // 启动 15 秒后先补拉一次，之后按固定间隔执行
+  setTimeout(() => void pollPrivateChatsOnce(), 15_000);
+  pollTimer = setInterval(() => void pollPrivateChatsOnce(), POLL_INTERVAL_MS);
+}
+
 // Webhook 事件分发器：Encrypt Key 解密、Verification Token 验签、
 // URL verification challenge 全部由官方 SDK 处理，凭证每次请求从数据库动态读取
 const eventDispatcher = new lark.EventDispatcher({
@@ -1057,7 +1186,15 @@ async function handleApiRoute(request, response, url) {
       lastConnectedAt: subscriptionStatus.lastConnectedAt,
       error: subscriptionStatus.error,
       webhookPath: "/webhook/feishu",
+      poll: { ...pollStatus },
     });
+    return;
+  }
+
+  // 手动触发一次私聊历史消息补拉（便于排查与即时回填）
+  if (pathname === "/api/poll" && method === "POST") {
+    const result = await pollPrivateChatsOnce();
+    sendJson(response, 200, { ok: !result.error, poll: { ...result } });
     return;
   }
 
@@ -1112,6 +1249,9 @@ async function handleApiRoute(request, response, url) {
     let query = getSupabaseClient()
       .from("feishu_events")
       .select("id, event_id, event_type, chat_id, chat_type, sender_id, sender_name, message_type, content_text, event_time, received_at")
+      // 按消息发生时间倒序（补拉的历史消息可能晚于实时事件入库），
+      // 时间相同则按入库 id 倒序，保证列表始终呈现真实的时间线
+      .order("event_time", { ascending: false })
       .order("id", { ascending: false })
       .limit(limit);
     if (eventType) {
@@ -1225,4 +1365,6 @@ server.listen(port, host, () => {
   console.log(`QW Page server listening on http://${host}:${port}`);
   // 启动时若已配置凭证，自动建立飞书长连接订阅（失败不影响 HTTP 服务）
   void restartEventSubscription().catch(() => {});
+  // 私聊历史消息定时补拉：覆盖长连接断线期间漏收的消息
+  startPrivateChatPolling();
 });

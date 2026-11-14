@@ -60,6 +60,16 @@ interface Stats {
   events: number;
 }
 
+interface PollStatus {
+  enabled: boolean;
+  intervalMs: number;
+  lastRunAt: string | null;
+  chats: number;
+  scanned: number;
+  inserted: number;
+  error: string;
+}
+
 interface Subscription {
   mode: "websocket";
   state: "disabled" | "connecting" | "connected" | "reconnecting" | "failed";
@@ -67,6 +77,7 @@ interface Subscription {
   lastConnectedAt: string | null;
   error: string;
   webhookPath: string;
+  poll?: PollStatus;
 }
 
 type TabKey = "contacts" | "events" | "settings";
@@ -424,6 +435,7 @@ function EventsTab() {
   const [subscription, setSubscription] = useState<Subscription | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [polling, setPolling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const webhookUrl = `${window.location.origin}/webhook/feishu`;
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -478,6 +490,20 @@ function EventsTab() {
     }
   }
 
+  /** 手动触发一次私聊历史消息补拉，用于排查或即时回填 */
+  async function runHistoryPoll() {
+    setPolling(true);
+    try {
+      await apiPost("/api/poll");
+      await Promise.all([loadEvents(), loadSubscription()]);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "补拉失败");
+    } finally {
+      setPolling(false);
+    }
+  }
+
   const stateMeta: Record<Subscription["state"], { label: string; cls: string }> = {
     connected: { label: "长连接已建立", cls: "ok" },
     connecting: { label: "正在建立连接…", cls: "warn" },
@@ -505,6 +531,21 @@ function EventsTab() {
         <div className="stat-card">
           <span className="stat-label">最近连接</span>
           <span className="stat-value small">{formatTime(subscription?.lastConnectedAt ?? null)}</span>
+        </div>
+        <div className="stat-card">
+          <span className="stat-label">私聊历史补拉（定时）</span>
+          <span className="stat-value small">
+            {subscription?.poll
+              ? `每 ${Math.round(subscription.poll.intervalMs / 1000)} 秒 · ${subscription.poll.chats} 个会话`
+              : "—"}
+          </span>
+          <span className="sub">
+            {subscription?.poll?.error
+              ? `失败：${subscription.poll.error}`
+              : subscription?.poll?.lastRunAt
+                ? `最近 ${formatTime(subscription.poll.lastRunAt)} · 补入 ${subscription.poll.inserted} 条`
+                : "断线期间漏收的消息由此回填"}
+          </span>
         </div>
       </div>
 
@@ -554,6 +595,9 @@ function EventsTab() {
         </label>
         <button className="ghost-btn" onClick={() => { void loadEvents(); void loadSubscription(); }}>
           立即刷新
+        </button>
+        <button className="ghost-btn" disabled={polling} onClick={() => void runHistoryPoll()}>
+          {polling ? "补拉中…" : "立即补拉私聊历史"}
         </button>
         <span className="count-tag">{events.length} 条事件</span>
         {error && <span className="inline-msg error">{error}</span>}
